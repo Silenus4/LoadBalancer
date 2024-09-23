@@ -1,4 +1,6 @@
-﻿public class HealthCheckService
+﻿namespace LoadBalancer;
+
+public class HealthCheckService
 {
     private readonly HttpClient _httpClient;
 

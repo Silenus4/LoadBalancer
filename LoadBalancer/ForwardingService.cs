@@ -1,4 +1,6 @@
-﻿public class ForwardingService
+﻿namespace LoadBalancer;
+
+public class ForwardingService
 {
     private readonly HttpClient _httpClient;
     private readonly ILogger<ForwardingService> _logger;
@@ -15,11 +17,12 @@
 
     public async Task ForwardRequestToBackend(HttpContext context, string backendServer)
     {
-        // Start logging the process
         _logger.LogInformation("Starting to forward request to {BackendServer}", backendServer);
+
         var requestStartTime = DateTime.UtcNow;
 
         using var cts = new CancellationTokenSource(_requestTimeout);
+
         context.RequestAborted.Register(cts.Cancel);
 
         var attempt = 0;
@@ -27,60 +30,70 @@
         while (attempt <= _maxRetries)
         {
             attempt++;
+
             try
             {
-                // Forward the request to the backend server
-                var requestMessage = CreateHttpRequestMessage(context, backendServer);
+                if (string.IsNullOrEmpty(context.Request.Path))
+                {
+                    context.Response.StatusCode = StatusCodes.Status400BadRequest;
+
+                    await context.Response.WriteAsync("Invalid request path", cts.Token);
+
+                    return;
+                }
+
+                var backendUrl = $"{backendServer}{context.Request.Path}{context.Request.QueryString}";
+
+                var requestMessage = await CreateHttpRequestMessageAsync(context, backendUrl);
+
                 var backendResponse = await _httpClient.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, cts.Token);
 
-                // Log the backend response
                 _logger.LogInformation("Received response {StatusCode} from {BackendServer}", backendResponse.StatusCode, backendServer);
 
-                // Forward the response back to the client
                 await CopyResponseFromBackend(context, backendResponse);
-                break; // Success, exit the retry loop
+
+                break;
             }
             catch (TaskCanceledException) when (cts.Token.IsCancellationRequested)
             {
-                // Timeout or client disconnected
                 _logger.LogWarning("Request to {BackendServer} timed out after {Timeout} ms", backendServer, _requestTimeout.TotalMilliseconds);
+
                 context.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
-                await context.Response.WriteAsync("Gateway Timeout");
-                break; // Exit on timeout
+
+                await context.Response.WriteAsync("Gateway Timeout", cts.Token);
+
+                break;
             }
             catch (HttpRequestException ex)
             {
-                // Log any request exceptions (network failures, DNS failures, etc.)
                 _logger.LogError(ex, "Error forwarding request to {BackendServer} on attempt {Attempt}", backendServer, attempt);
 
                 if (attempt > _maxRetries)
                 {
                     _logger.LogError("Exceeded max retries ({MaxRetries}) forwarding request to {BackendServer}", _maxRetries, backendServer);
+
                     context.Response.StatusCode = StatusCodes.Status502BadGateway;
-                    await context.Response.WriteAsync("Bad Gateway");
+
+                    await context.Response.WriteAsync("Bad Gateway", cts.Token);
+
                     break;
                 }
 
-                // Retry on next iteration
-                await Task.Delay(TimeSpan.FromSeconds(2)); // Add a small delay before retrying
+                await Task.Delay(TimeSpan.FromSeconds(2), cts.Token);
             }
         }
 
-        // Log the total request duration
-        var requestDuration = DateTime.UtcNow - requestStartTime;
-        _logger.LogInformation("Request forwarding completed in {RequestDuration} ms", requestDuration.TotalMilliseconds);
+        _logger.LogInformation("Request forwarding completed in {RequestDuration} ms", (DateTime.UtcNow - requestStartTime).TotalMilliseconds);
     }
 
-    private static HttpRequestMessage CreateHttpRequestMessage(HttpContext context, string backendServer)
+    private static async Task<HttpRequestMessage> CreateHttpRequestMessageAsync(HttpContext context, string backendUrl)
     {
         var requestMessage = new HttpRequestMessage
         {
-            // Set method and request URI
             Method = new HttpMethod(context.Request.Method),
-            RequestUri = new Uri($"{backendServer}{context.Request.Path}{context.Request.QueryString}")
+            RequestUri = new Uri(backendUrl)
         };
 
-        // Copy the request headers
         foreach (var header in context.Request.Headers)
         {
             if (!requestMessage.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray()))
@@ -89,36 +102,39 @@
             }
         }
 
-        // Copy the body if present
-        if (context.Request.ContentLength > 0 || context.Request.Body.CanRead)
-        {
-            requestMessage.Content = new StreamContent(context.Request.Body);
-        }
+        if (!(context.Request.ContentLength > 0) && !context.Request.Body.CanRead) 
+            return requestMessage;
+
+        context.Request.EnableBuffering();
+        context.Request.Body.Position = 0;
+
+        var memoryStream = new MemoryStream();
+        await context.Request.Body.CopyToAsync(memoryStream);
+        memoryStream.Position = 0;
+
+        requestMessage.Content = new StreamContent(memoryStream);
+        requestMessage.Content.Headers.ContentLength = memoryStream.Length;
 
         return requestMessage;
     }
 
     private static async Task CopyResponseFromBackend(HttpContext context, HttpResponseMessage backendResponse)
     {
-        // Copy status code
         context.Response.StatusCode = (int)backendResponse.StatusCode;
 
-        // Copy headers from the backend response
         foreach (var header in backendResponse.Headers)
-        {
-            context.Response.Headers[header.Key] = header.Value.ToArray();
-        }
+            if (header.Key != "Content-Length" && header.Key != "Transfer-Encoding")
+                context.Response.Headers[header.Key] = header.Value.ToArray();
 
         foreach (var header in backendResponse.Content.Headers)
-        {
-            context.Response.Headers[header.Key] = header.Value.ToArray();
-        }
+            if (header.Key != "Content-Length" && header.Key != "Transfer-Encoding")
+                context.Response.Headers[header.Key] = header.Value.ToArray();
 
-        // Ensure headers are flushed to the client
         await context.Response.StartAsync();
 
-        // Copy body
-        using var responseStream = await backendResponse.Content.ReadAsStreamAsync();
+        await using var responseStream = await backendResponse.Content.ReadAsStreamAsync();
         await responseStream.CopyToAsync(context.Response.Body);
+
+        await context.Response.CompleteAsync();
     }
 }

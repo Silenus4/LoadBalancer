@@ -1,4 +1,4 @@
-namespace LoadBalancer
+namespace LoadBalancerTestAPI
 {
     public class WeatherForecast
     {

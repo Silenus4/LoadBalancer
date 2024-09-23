@@ -1,4 +1,4 @@
-﻿using LoadBalancer;
+﻿namespace LoadBalancer;
 
 public class LoadBalancingStrategyFactory
 {

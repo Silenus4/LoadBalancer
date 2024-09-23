@@ -1,17 +1,12 @@
-﻿using LoadBalancer;
-using StackExchange.Redis;
+﻿using StackExchange.Redis;
 
-public class StickySessionStrategy : ILoadBalancingStrategy
+namespace LoadBalancer;
+
+public class StickySessionStrategy(IConnectionMultiplexer redis, HealthCheckService healthCheckService)
+    : ILoadBalancingStrategy
 {
-    private readonly IDatabase _db;
-    private readonly HealthCheckService _healthCheckService;
-    private int _nextIndex = 0;
-
-    public StickySessionStrategy(IConnectionMultiplexer redis, HealthCheckService healthCheckService)
-    {
-        _db = redis.GetDatabase();
-        _healthCheckService = healthCheckService;
-    }
+    private readonly IDatabase _db = redis.GetDatabase();
+    private int _nextIndex;
 
     public async Task<string> GetBackendServer(HttpContext context, List<string> backendServers)
     {
@@ -21,23 +16,24 @@ public class StickySessionStrategy : ILoadBalancingStrategy
         {
             var backendServer = await _db.StringGetAsync(sessionId);
 
-            if (backendServer.HasValue && await _healthCheckService.IsServerHealthy(backendServer))
+            if (backendServer.HasValue && await healthCheckService.IsServerHealthy(backendServer))
             {
                 return backendServer;
             }
         }
 
+        //TODO: ???
         return await GetHealthyRoundRobinServer(backendServers);
     }
 
-    private async Task<string> GetHealthyRoundRobinServer(List<string> backendServers)
+    private async Task<string> GetHealthyRoundRobinServer(IReadOnlyList<string> backendServers)
     {
-        for (int i = 0; i < backendServers.Count; i++)
+        foreach (var item in backendServers)
         {
             var index = Interlocked.Increment(ref _nextIndex) % backendServers.Count;
             var server = backendServers[index];
 
-            if (await _healthCheckService.IsServerHealthy(server))
+            if (await healthCheckService.IsServerHealthy(server))
             {
                 return server;
             }
